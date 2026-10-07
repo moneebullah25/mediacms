@@ -3,9 +3,9 @@
 Panopto authenticates an API client against a user, not against itself: the client is
 created as a "User-Based Server Application" and exchanges a service account's password
 for a token, which is why the connection asks for both. Everything the migration reads
-goes through /Panopto/api/v1 with that token, except the user list: the REST API creates
-users but will not enumerate them, so that one call goes to the older SOAP service, which
-authenticates with the same account's password rather than a token.
+goes through /Panopto/api/v1 with that token, except the user list, group members and
+access levels: the REST API offers none of them, so those go to the older SOAP services,
+which authenticate with the same account's password rather than a token.
 
 The media file is the exception. The REST API describes a session but will not hand over
 its video, so the file comes from the same podcast URL the viewer's download button uses,
@@ -37,11 +37,32 @@ LEGACY_LOGIN_PATH = f"{API_PREFIX}/auth/legacyLogin"
 # instance", with a real total and real paging
 USER_SOAP_PATH = "/Panopto/PublicAPI/4.0/UserManagement.svc"
 SOAP_CONTRACT = "http://tempuri.org/IUserManagement"
+ACCESS_SOAP_PATH = "/Panopto/PublicAPI/4.0/AccessManagement.svc"
+ACCESS_SOAP_CONTRACT = "http://tempuri.org/IAccessManagement"
 SOAP_TYPES = "http://schemas.datacontract.org/2004/07/Panopto.Server.Services.PublicAPI.V40"
 PODCAST_PATH = "/Panopto/Podcast/Download/{session_id}.mp4"
 PODCAST_PARAMS = {"mediaTargetType": "videoPodcast"}
 
 MAX_PAGES = 400
+
+SYSTEM_ROOT_FOLDERS = ("users", "remote recorders")
+PERSONAL_ROOT_FOLDER = "users"
+
+GROUP_TYPE_SYSTEM = 1
+GROUP_TYPE_EXTERNAL = 2
+
+SYSTEM_ROLES = {2: "admin", 1: "editor"}
+
+ACCESS_LISTS = {
+    "UsersWithViewerAccess": ("User", "Viewer"),
+    "UsersWithCreatorAccess": ("User", "Creator"),
+    "UsersWithPublisherAccess": ("User", "Publisher"),
+    "GroupsWithViewerAccess": ("Group", "Viewer"),
+    "GroupsWithCreatorAccess": ("Group", "Creator"),
+    "GroupsWithPublisherAccess": ("Group", "Publisher"),
+    "UsersWithDirectViewerAccess": ("User", "Viewer"),
+    "GroupsWithDirectViewerAccess": ("Group", "Viewer"),
+}
 
 WALK_LIMIT = 400
 
@@ -90,6 +111,23 @@ def session_is_importable(session):
     if session.get("IsWebcast") and not session.get("Duration"):
         return False
     return True
+
+
+def local_name(node):
+    return node.tag.rsplit("}", 1)[-1]
+
+
+def access_details(element):
+    is_public = False
+    principals = []
+    for child in list(element):
+        name = local_name(child)
+        if name == "IsPublic":
+            is_public = (child.text or "").strip().lower() == "true"
+        elif name in ACCESS_LISTS:
+            kind, role = ACCESS_LISTS[name]
+            principals.extend((kind, guid.text, role) for guid in child if guid.text)
+    return is_public, principals
 
 
 class PanoptoClient:
@@ -166,7 +204,7 @@ class PanoptoClient:
             raise PanoptoAPIError(f"{error}: {description}")
         return None
 
-    def soap(self, operation, body):
+    def soap(self, operation, body, path=USER_SOAP_PATH, contract=SOAP_CONTRACT, attempt=1):
         """One call against the SOAP user API, returning the parsed response element.
 
         SOAP takes the account's own password rather than a bearer token: a token is
@@ -182,17 +220,27 @@ class PanoptoClient:
             f"{body}"
             f"</{operation}></s:Body></s:Envelope>"
         )
-        url = f"{self.service_url}{USER_SOAP_PATH}"
+        url = f"{self.service_url}{path}"
         try:
             response = self.session.post(
                 url,
                 data=envelope.encode("utf-8"),
-                headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f'"{SOAP_CONTRACT}/{operation}"'},
+                headers={"Content-Type": "text/xml; charset=utf-8", "SOAPAction": f'"{contract}/{operation}"'},
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:
+            if attempt < RATE_LIMIT_ATTEMPTS:
+                logger.info("panopto: %s unreachable, retrying (attempt %d): %s", operation, attempt, exc)
+                time.sleep(RATE_LIMIT_WAIT * attempt)
+                return self.soap(operation, body, path, contract, attempt + 1)
             raise PanoptoAPIError(f"Could not reach {url}: {exc}") from exc
 
+        if response.status_code == 429 and attempt < RATE_LIMIT_ATTEMPTS:
+            self._wait_out_rate_limit(response, operation, attempt)
+            return self.soap(operation, body, path, contract, attempt + 1)
+        if response.status_code >= 500 and attempt < RATE_LIMIT_ATTEMPTS and "<faultstring" not in response.text:
+            time.sleep(RATE_LIMIT_WAIT * attempt)
+            return self.soap(operation, body, path, contract, attempt + 1)
         if response.status_code >= 400:
             fault = re.search(r"<faultstring[^>]*>(.*?)</faultstring>", response.text, re.S)
             raise PanoptoAPIError(f"{operation} answered {response.status_code}: {fault.group(1).strip() if fault else response.reason}")
@@ -363,6 +411,7 @@ class PanoptoProvider(BaseProvider):
         "create_users": True,
         "fallback_username": "admin",
         "import_captions": True,
+        "import_personal_folders": True,
         "max_items": None,
     }
 
@@ -370,6 +419,9 @@ class PanoptoProvider(BaseProvider):
         super().__init__(connection, options)
         self._client = None
         self._folders = {}
+        self._folder_access = {}
+        self._groups = {}
+        self._group_members = {}
 
     @classmethod
     def source_system(cls, connection):
@@ -477,6 +529,91 @@ class PanoptoProvider(BaseProvider):
         roots = [folder for folder in folders.values() if not (folder.get("ParentFolder") or {}).get("Id")]
         return roots, folders, sessions
 
+    def root_name(self, folder_id):
+        line = self.chain(folder_id) if folder_id else []
+        return (line[-1].get("Name") or "").strip().lower() if line else ""
+
+    def folder_kind(self, folder_id):
+        root = self.root_name(folder_id)
+        if root == PERSONAL_ROOT_FOLDER:
+            return "personal"
+        if root in SYSTEM_ROOT_FOLDERS:
+            return "system"
+        return "folder"
+
+    def wanted(self, folder_id, selected):
+        if not selected or self.within_folders(folder_id, selected):
+            return True
+        return bool(self.options.get("import_personal_folders", True)) and self.folder_kind(folder_id) == "personal"
+
+    def group(self, group_id):
+        if group_id not in self._groups:
+            try:
+                self._groups[group_id] = self.client.call(f"/groups/{group_id}") or {}
+            except PanoptoAPIError as exc:
+                logger.info("panopto: group %s unreadable: %s", group_id, exc)
+                self._groups[group_id] = {}
+        return self._groups[group_id]
+
+    def group_members(self, group_id):
+        if group_id not in self._group_members:
+            answered = self.client.soap("GetUsersInGroup", f"<groupId>{escape(group_id)}</groupId>")
+            self._group_members[group_id] = [node.text for node in answered.iter() if local_name(node) == "guid" and node.text]
+        return self._group_members[group_id]
+
+    def describe_access(self, is_public, principals):
+        access = {"public": is_public, "organisation": False, "lms": False, "principals": []}
+        seen = set()
+        for kind, principal_id, role in principals:
+            if (kind, principal_id, role) in seen:
+                continue
+            seen.add((kind, principal_id, role))
+            if kind == "Group":
+                group = self.group(principal_id)
+                if group.get("GroupType") == GROUP_TYPE_SYSTEM:
+                    if "public" in (group.get("Name") or "").lower():
+                        access["public"] = True
+                    else:
+                        access["organisation"] = True
+                    continue
+                if group.get("GroupType") == GROUP_TYPE_EXTERNAL:
+                    access["lms"] = True
+            access["principals"].append({"type": kind, "id": principal_id, "role": role})
+        return access
+
+    def folder_access(self, folder_id):
+        if folder_id in self._folder_access:
+            return self._folder_access[folder_id]
+        is_public, principals = False, []
+        try:
+            answered = self.client.soap("GetFolderAccessDetails", f"<folderId>{escape(folder_id)}</folderId>", ACCESS_SOAP_PATH, ACCESS_SOAP_CONTRACT)
+            result = next((node for node in answered.iter() if local_name(node) == "GetFolderAccessDetailsResult"), None)
+            if result is not None:
+                is_public, principals = access_details(result)
+        except PanoptoAPIError as exc:
+            logger.info("panopto: access of folder %s unreadable: %s", folder_id, exc)
+        try:
+            permissions = (self.client.call(f"/folders/{folder_id}/permissions") or {}).get("Results") or []
+            named = [((row.get("Principal") or {}).get("Type"), (row.get("Principal") or {}).get("Id"), (row.get("Role") or {}).get("Name")) for row in permissions]
+            named = [row for row in named if row[0] and row[1] and row[2]]
+            if named:
+                principals = [row for row in principals if row[0] == "Group" and self.group(row[1]).get("GroupType") == GROUP_TYPE_SYSTEM] + named
+        except PanoptoAPIError as exc:
+            logger.info("panopto: permissions of folder %s unreadable: %s", folder_id, exc)
+        self._folder_access[folder_id] = self.describe_access(is_public, principals)
+        return self._folder_access[folder_id]
+
+    def session_access(self, session_id):
+        try:
+            answered = self.client.soap("GetSessionAccessDetails", f"<sessionId>{escape(session_id)}</sessionId>", ACCESS_SOAP_PATH, ACCESS_SOAP_CONTRACT)
+        except PanoptoAPIError as exc:
+            logger.info("panopto: access of session %s unreadable: %s", session_id, exc)
+            return self.describe_access(False, [])
+        result = next((node for node in answered.iter() if local_name(node) == "GetSessionAccessDetailsResult"), None)
+        if result is None:
+            return self.describe_access(False, [])
+        return self.describe_access(*access_details(result))
+
     def within_folders(self, folder_id, selected):
         """Whether a folder is one of the chosen ones or sits under one"""
         if not folder_id:
@@ -544,6 +681,7 @@ class PanoptoProvider(BaseProvider):
     def list_categories(self):
         """The folders a person can choose from, with what each subtree holds"""
         roots, folders, sessions = self.discover()
+        roots = [root for root in roots if (root.get("Name") or "").strip().lower() not in SYSTEM_ROOT_FOLDERS]
         counts = {root["Id"]: {"entries": 0, "folders": 0} for root in roots}
 
         for folder_id in folders:
@@ -612,6 +750,14 @@ class PanoptoProvider(BaseProvider):
                 return ids, {"page": page}
             return ids, {"page": page + 1}
 
+        if phase == "categories":
+            if (cursor or {}).get("done"):
+                return [], dict(cursor)
+            selected = self.selected_folder_ids()
+            _roots, folders, _sessions = self.discover(selected or None)
+            wanted = [folder_id for folder_id in folders if self.folder_kind(folder_id) == "folder" and (not selected or self.within_folders(folder_id, selected))]
+            return sorted(wanted), {"done": True}
+
         if phase != "media":
             return [], dict(cursor or {})
 
@@ -630,7 +776,7 @@ class PanoptoProvider(BaseProvider):
                 if not session_is_importable(row):
                     continue
                 folder_id = row.get("Folder") or (row.get("FolderDetails") or {}).get("Id")
-                if selected and not self.within_folders(folder_id, selected):
+                if not self.wanted(folder_id, selected):
                     continue
                 found.append(str(row["Id"]))
 
@@ -670,6 +816,8 @@ class PanoptoProvider(BaseProvider):
                 "parentId": str((folder.get("ParentFolder") or {}).get("Id") or ""),
                 "parentName": (folder.get("ParentFolder") or {}).get("Name") or "",
             },
+            "folder_kind": self.folder_kind(folder_id) if folder_id else "folder",
+            "access": self.session_access(str(session.get("Id") or source_id)),
             "download_url": urls.get("DownloadUrl") or self.client.podcast_url(source_id),
             "captions": captions,
         }
@@ -688,6 +836,7 @@ class PanoptoProvider(BaseProvider):
             "username": user.get("Username") or "",
             "email": (user.get("Email") or "").strip(),
             "fullName": " ".join(part for part in (first, last) if part),
+            "role": SYSTEM_ROLES.get(user.get("SystemRole"), ""),
         }
 
     def download(self, url, dest_path):

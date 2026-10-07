@@ -237,6 +237,11 @@ const PANOPTO_OPTIONS = [
     label: 'Import captions',
     help: 'Captions Panopto offers for a recording are migrated as subtitles.',
   },
+  {
+    key: 'import_personal_folders',
+    label: 'Include My Folder recordings',
+    help: "Recordings in everyone's My Folder are migrated to their owner's media, shared with the people the folder names. The Users folder itself is not offered above and its sub-folders do not become categories.",
+  },
 ];
 
 const PANOPTO_DEFAULT_OPTIONS = Object.assign(
@@ -244,6 +249,7 @@ const PANOPTO_DEFAULT_OPTIONS = Object.assign(
     source_category_ids: '',
     migrate_all_users: false,
     create_users: true,
+    import_personal_folders: true,
     fallback_username: 'admin',
     import_captions: true,
   },

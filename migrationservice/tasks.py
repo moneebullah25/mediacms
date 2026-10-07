@@ -21,6 +21,7 @@ from files.models import (
     Encoding,
     Language,
     Media,
+    MediaPermission,
     Playlist,
     PlaylistMedia,
     Subtitle,
@@ -33,10 +34,11 @@ from users.models import User
 
 from .compose import (
     MAX_STREAMS,
-    compose_pip,
-    inset_width_for,
-    pick_base_and_inset,
-    pick_inset_flavor,
+    canvas_size,
+    compose_side_by_side,
+    layout_boxes,
+    pick_flavor_for_width,
+    stream_area,
 )
 from .models import MigrationRecord, MigrationService
 from .providers import get_provider
@@ -440,6 +442,8 @@ def import_panopto_user(service, provider, source_id):
         user._skip_admin_notification = True
         user.save()
         created = True
+        if payload.get("role"):
+            user.set_role_from_mapping(payload["role"])
 
     record(service, "user", source_id, "success", f"{'created' if created else 'linked to existing user'} {user.username}", target=user)
     return user
@@ -477,6 +481,99 @@ def unique_panopto_title(title, parent_name, taken):
         index += 1
 
 
+PANOPTO_RBAC_ROLES = {
+    "viewer": "member",
+    "creator": "contributor",
+    "content organizer": "contributor",
+    "caption requester": "contributor",
+    "publisher": "manager",
+    "analytics manager": "manager",
+}
+
+PANOPTO_SHARE_ROLES = {
+    "viewer": "viewer",
+    "creator": "editor",
+    "content organizer": "editor",
+    "caption requester": "editor",
+    "publisher": "owner",
+    "analytics manager": "owner",
+}
+
+RBAC_ROLE_RANK = ("member", "contributor", "manager")
+SHARE_ROLE_RANK = ("viewer", "editor", "owner")
+
+
+def panopto_people(service, provider, principals, role_map, rank):
+    people = {}
+    for principal in principals:
+        role = role_map.get((principal.get("role") or "").strip().lower())
+        if not role:
+            continue
+        if principal.get("type") == "User":
+            user_ids = [principal["id"]]
+        else:
+            try:
+                user_ids = provider.group_members(principal["id"])
+            except Exception as exc:  # noqa: BLE001
+                service.append_log(f"could not read the members of Panopto group {principal['id']}: {exc}")
+                continue
+        for user_id in user_ids:
+            try:
+                user = import_panopto_user(service, provider, user_id)
+            except Exception as exc:  # noqa: BLE001
+                service.append_log(f"could not import Panopto user {user_id}: {exc}")
+                continue
+            if user not in people or rank.index(role) > rank.index(people[user]):
+                people[user] = role
+    return people
+
+
+def grant_rbac_role(group, user, role):
+    membership = RBACMembership.objects.filter(user=user, rbac_group=group).first()
+    if membership is None:
+        RBACMembership.objects.create(user=user, rbac_group=group, role=role)
+    elif RBAC_ROLE_RANK.index(role) > RBAC_ROLE_RANK.index(membership.role):
+        membership.role = role
+        membership.save(update_fields=["role"])
+
+
+def attach_panopto_group(service, provider, category, folder, access):
+    folder_id = str(folder.get("id"))
+    uid = rbac_group_uid(service, folder_id)
+    group = RBACGroup.objects.filter(uid=uid, identity_provider=None).first()
+    if group is None:
+        taken = set(RBACGroup.objects.filter(identity_provider=None).values_list("name", flat=True))
+        group = RBACGroup.objects.create(
+            uid=uid,
+            name=unique_group_name(category.title, folder_id, taken),
+            description=f"Members of {(folder.get('fullName') or category.title).replace('>', ': ')}",
+        )
+    group.categories.add(category)
+
+    people = panopto_people(service, provider, access.get("principals") or [], PANOPTO_RBAC_ROLES, RBAC_ROLE_RANK)
+    for user, role in people.items():
+        grant_rbac_role(group, user, role)
+    service.append_log(f"folder {folder_id}: {len(people)} members in group {group.name}")
+    return group
+
+
+def configure_panopto_folder_access(service, provider, category, folder):
+    access = provider.folder_access(str(folder.get("id")))
+    if access.get("public"):
+        return
+    if not getattr(settings, "USE_RBAC", False):
+        service.append_log(f"folder {folder.get('id')}: restricted in Panopto, but RBAC is off, so '{category.title}' is a plain category")
+        return
+    category.is_rbac_category = True
+    category.is_lms_course = bool(access.get("lms"))
+    category.save(update_fields=["is_rbac_category", "is_lms_course"])
+    attach_panopto_group(service, provider, category, folder, access)
+
+
+def import_panopto_folder(service, provider, source_id):
+    return get_or_import_panopto_folder(service, provider, provider.fetch_category(source_id))
+
+
 def get_or_import_panopto_folder(service, provider, folder):
     """The MediaCMS category for one Panopto folder, created if this run has not made it.
 
@@ -508,6 +605,7 @@ def get_or_import_panopto_folder(service, provider, folder):
             is_global=True,
         )
         record(service, "category", folder_id, "success", f"created category {category.title}", target=category)
+    configure_panopto_folder_access(service, provider, category, folder)
     return category
 
 
@@ -541,9 +639,26 @@ def import_panopto_session(service, provider, source_id):
             Media.objects.filter(pk=media.pk).update(add_date=created_at)
 
         folder = payload.get("folder") or {}
-        category = get_or_import_panopto_folder(service, provider, folder)
-        if category:
-            media.category.add(category)
+        folder_kind = payload.get("folder_kind") or "folder"
+        access = payload.get("access") or {}
+        folder_access = provider.folder_access(str(folder["id"])) if folder.get("id") else {}
+
+        media.state = "public" if access.get("public") or folder_access.get("public") else "private"
+        media.save(update_fields=["state", "listable"])
+
+        if folder_kind == "folder":
+            category = get_or_import_panopto_folder(service, provider, folder)
+            if category:
+                media.category.add(category)
+                for group in category.rbac_groups.all():
+                    grant_rbac_role(group, media.user, "contributor")
+
+        principals = list(access.get("principals") or [])
+        if folder_kind == "personal":
+            principals += folder_access.get("principals") or []
+        for user, permission in panopto_people(service, provider, principals, PANOPTO_SHARE_ROLES, SHARE_ROLE_RANK).items():
+            if user != media.user:
+                MediaPermission.objects.update_or_create(owner_user=media.user, user=user, media=media, defaults={"permission": permission})
 
         if options.get("import_captions", True):
             for caption in payload.get("captions") or []:
@@ -1093,62 +1208,122 @@ def _throughput(size_bytes, seconds):
     return f"({megabytes:.0f}MB at {megabytes / seconds:.1f}MB/s)"
 
 
-def combine_streams(service, provider, source_id, data, tmp_dir, want_renditions):
-    """Draw a multi stream recording as one picture, camera inset over screen.
+STREAM_SOURCE_SUFFIX = ":stream"
+
+
+def combine_streams(service, provider, source_id, data, children, tmp_dir, want_renditions):
+    """Draw a multi stream recording as one picture, its streams side by side.
 
     Returns (original_flavor, flavors, extension) with a local path on each, or None when
-    this entry is not a multi stream recording. With renditions wanted, every screen flavor
-    becomes one: the inset is a quarter of the frame, so a single camera file serves them
-    all rather than one download per rung.
+    this entry is not a multi stream recording or its streams cannot be drawn together.
+    With renditions wanted, every flavor of the biggest stream becomes one: each smaller
+    stream is fetched once and drawn into its box on every rendition.
     """
-    children = provider.child_entries(source_id)
     if not children:
         return None
 
-    entry = data.get("entry") or {}
     if len(children) + 1 > MAX_STREAMS:
         kept = children[: MAX_STREAMS - 1]
-        service.append_log(f"entry {source_id}: {len(children) + 1} streams, combining the first {MAX_STREAMS} and leaving {', '.join(child['id'] for child in children[len(kept):])}")
+        left = ", ".join((child.get("entry") or {}).get("id") or "" for child in children[len(kept) :])
+        service.append_log(f"entry {source_id}: {len(children) + 1} streams, combining the first {MAX_STREAMS} and leaving {left}")
         children = kept
 
-    child_data = provider.fetch_media(children[0]["id"])
-    child_entry = child_data.get("entry") or {}
-    base_entry, inset_entry = pick_base_and_inset([entry, child_entry])
-    base_flavors = data.get("flavors") if base_entry is entry else child_data.get("flavors")
-    inset_flavors = child_data.get("flavors") if base_entry is entry else data.get("flavors")
-
-    base_original = pick_original_flavor(base_flavors or [])
-    inset_original = pick_inset_flavor(inset_flavors or [], inset_width_for(base_entry.get("width") or 0))
-    if base_original is None or inset_original is None:
+    streams = children + [data]
+    driver = max(children, key=lambda stream: stream_area(stream.get("entry") or {}))
+    driver_original = pick_original_flavor(driver.get("flavors") or [])
+    if driver_original is None:
         service.append_log(f"entry {source_id}: a stream has no downloadable flavor, importing it on its own")
         return None
 
-    inset_path = os.path.join(tmp_dir, f"inset_{inset_original['id']}.mp4")
-    provider.download_flavor(inset_original, inset_path)
-    service.append_log(f"entry {source_id}: multi stream, {base_entry.get('id')} with {inset_entry.get('id')} inset over it")
+    def canvas_height(flavor):
+        return flavor.get("height") or (driver.get("entry") or {}).get("height") or 1080
+
+    width, height = canvas_size(canvas_height(driver_original))
+    boxes = layout_boxes(len(streams), width, height)
+    fixed_paths = {}
+    for index, stream in enumerate(streams):
+        if stream is driver:
+            continue
+        flavor = pick_flavor_for_width(stream.get("flavors") or [], boxes[index][2])
+        if flavor is None:
+            service.append_log(f"entry {source_id}: a stream has no downloadable flavor, importing it on its own")
+            return None
+        fixed_paths[index] = os.path.join(tmp_dir, f"stream_{flavor['id']}.mp4")
+        provider.download_flavor(flavor, fixed_paths[index])
+
+    child_ids = ", ".join((child.get("entry") or {}).get("id") or "" for child in children)
+    service.append_log(f"entry {source_id}: multi stream, {child_ids} side by side with {source_id}")
 
     def draw(flavor, name):
         source = os.path.join(tmp_dir, f"src_{flavor['id']}.mp4")
         provider.download_flavor(flavor, source)
+        rung_width, rung_height = canvas_size(canvas_height(flavor))
+        paths = [source if stream is driver else fixed_paths[index] for index, stream in enumerate(streams)]
         dest = os.path.join(tmp_dir, name)
-        compose_pip(source, inset_path, dest, base_width=flavor.get("width") or 0)
+        compose_side_by_side(paths, dest, rung_width, rung_height)
         if os.path.exists(source):
             os.remove(source)
-        return dest
+        return dict(flavor, fileExt="mp4", width=rung_width, height=rung_height, _local_path=dest)
 
-    original = dict(base_original, fileExt="mp4", _local_path=draw(base_original, f"{source_id}.mp4"))
+    try:
+        original = draw(driver_original, f"{source_id}.mp4")
+    except Exception as exc:  # noqa: BLE001
+        service.append_log(f"entry {source_id}: could not combine the streams, importing it on its own: {exc}")
+        return None
 
     composed = []
     if want_renditions:
-        for flavor in base_flavors or []:
-            if flavor.get("id") == base_original.get("id") or (flavor.get("fileExt") or "").lower() not in ("mp4", "webm"):
+        for flavor in driver.get("flavors") or []:
+            if flavor.get("id") == driver_original.get("id") or (flavor.get("fileExt") or "").lower() not in ("mp4", "webm"):
                 continue
             try:
-                composed.append(dict(flavor, fileExt="mp4", _local_path=draw(flavor, f"pip_{flavor['id']}.mp4")))
+                composed.append(draw(flavor, f"combined_{flavor['id']}.mp4"))
             except Exception as exc:  # noqa: BLE001 - one rung must not lose the media
                 service.append_log(f"entry {source_id}: could not combine flavor {flavor.get('id')}: {exc}")
 
     return original, composed + [original], "mp4"
+
+
+def import_stream_item(service, provider, key, stream, number, main, tmp_dir):
+    existing = MigrationRecord.objects.filter(service=service, object_type="media", source_id=key).first()
+    previous = existing.target() if existing else None
+    if existing and existing.status in ("success", "skipped") and previous is not None:
+        return previous
+    if previous is not None:
+        previous.delete()
+
+    options = service.get_options()
+    try:
+        flavors = stream.get("flavors") or []
+        original = pick_original_flavor(flavors)
+        if original is None:
+            raise ValueError("no downloadable flavor")
+        extension = source_extension(stream.get("entry") or {}, original)
+        path = os.path.join(tmp_dir, f"stream_original_{original['id']}.{extension}")
+        provider.download_flavor(original, path)
+
+        media = Media(user=main.user, title=f"{main.title[:88]} (stream {number})", description=main.description)
+        if options.get("skip_transcoding", True):
+            media._do_not_transcode = True
+        media._skip_admin_notification = True
+        with open(path, "rb") as handle:
+            media.media_file.save(content=File(handle), name=f"{key.replace(STREAM_SOURCE_SUFFIX, '_stream')}.{extension}", save=False)
+        media.save()
+        record(service, "media", key, "failed", "import started", target=media)
+
+        if media.media_type == "video" and options.get("skip_transcoding", True):
+            attach_flavor_encodings(service, provider, media, flavors, original, path, tmp_dir)
+
+        media.state = main.state
+        media.add_date = main.add_date
+        media.save(update_fields=["state", "add_date", "listable"])
+    except Exception as exc:  # noqa: BLE001
+        record(service, "media", key, "failed", f"stream {number} of media {main.friendly_token}: {exc}")
+        service.append_log(f"media {main.friendly_token}: stream {number} ({key}) failed: {exc}")
+        return None
+
+    record(service, "media", key, "success", f"imported stream {number} of '{main.title}' as media {media.id}", target=media)
+    return media
 
 
 def import_media_entry(service, provider, source_id):
@@ -1187,10 +1362,12 @@ def import_media_entry(service, provider, source_id):
 
     with tempfile.TemporaryDirectory(dir=settings.TEMP_DIRECTORY) as tmp_dir:
         combined = None
+        children = []
         if not is_image:
             with timings.step("multi stream") as step:
-                combined = combine_streams(service, provider, source_id, data, tmp_dir, options.get("skip_transcoding", True))
-                step.extra = "(combined)" if combined else "(single stream)"
+                children = [provider.fetch_media(child["id"]) for child in provider.child_entries(source_id)]
+                combined = combine_streams(service, provider, source_id, data, children, tmp_dir, options.get("skip_transcoding", True))
+                step.extra = "(combined)" if combined else ("(not combined)" if children else "(single stream)")
 
         if combined is not None:
             original, flavors, extension = combined
@@ -1239,6 +1416,13 @@ def import_media_entry(service, provider, source_id):
         with timings.step("metadata + categories"):
             apply_entry_metadata(service, provider, media, data)
 
+        if children:
+            streams = [(f"{source_id}{STREAM_SOURCE_SUFFIX}" if combined is not None else None, data)]
+            streams += [((child.get("entry") or {}).get("id"), child) for child in children]
+            with timings.step("streams as media") as step:
+                imported = [import_stream_item(service, provider, key, stream, number, media, tmp_dir) for number, (key, stream) in enumerate(streams, start=1) if key]
+                step.extra = f"({len([item for item in imported if item is not None])} of {len(imported)})"
+
     service.append_log(timings.summary())
     media.refresh_from_db()
     record(service, "media", source_id, "success", f"imported '{media.title}' as media {media.id}", target=media)
@@ -1254,9 +1438,9 @@ RECORD_TYPE = {"users": "user", "groups": "group", "categories": "category", "me
 IMPORTERS = {"users": import_user, "groups": import_group, "categories": import_category, "media": import_media_entry, "playlists": import_playlist}
 
 
-PROVIDER_PHASES = {"youtube": ["media"], "panopto": ["users", "media"]}
+PROVIDER_PHASES = {"youtube": ["media"], "panopto": ["users", "categories", "media"]}
 
-PROVIDER_IMPORTERS = {"youtube": {"media": import_youtube_video}, "panopto": {"users": import_panopto_user, "media": import_panopto_session}}
+PROVIDER_IMPORTERS = {"youtube": {"media": import_youtube_video}, "panopto": {"users": import_panopto_user, "categories": import_panopto_folder, "media": import_panopto_session}}
 
 
 def phases_for(service):
